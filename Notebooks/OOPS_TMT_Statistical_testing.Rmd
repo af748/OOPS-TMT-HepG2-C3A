@@ -1,0 +1,538 @@
+---
+title: "OOPS_TMT_Statistical_testing"
+output: html_notebook
+---
+30-03-2023
+Notebook for statistical testing of my OOPS TMT experiment with toxic ASO vs non-toxic ASO vs vehicle
+
+```{r, message=FALSE}
+library(camprotR)
+library(ggplot2)
+library(MSnbase)
+library(DEqMS)
+library(limma)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(broom)
+library(biobroom)
+library(uniprotREST)
+library(here)
+
+```
+
+```{r}
+
+
+# prot_res_irs_norm is created in the previous vignette and is part of the snd1.kd.upr.rbp package
+exp1 <- readRDS(here('Results/input_tmt_protein.rds'))
+
+exp2 <- readRDS(here('Results/OOPS_tmt_protein.rds'))
+
+common_proteins <- intersect(rownames(exp1), rownames(exp2))
+
+#Combine the Input and RBP into one MSnset
+pData(exp1)$material='Input'
+pData(exp2)$material='RBP'
+
+fData(exp1) <- fData(exp1)[,c('Master.Protein.Accessions', "Master.Protein.Descriptions"),drop=FALSE]
+
+fData(exp2) <- fData(exp2)[,c('Master.Protein.Accessions', "Master.Protein.Descriptions"),drop=FALSE]
+
+expInputRBP <- MSnbase::combine(exp1[common_proteins,], exp2[common_proteins,])
+```
+
+```{r}
+data_to_model <- expInputRBP[,pData(expInputRBP)$Treatment!='Vehicle'] # or some equivalent filtering to remove the samples which are Vehicle treatment
+
+#assign input and RBPs as factors in the material column of the data_to_model dataset.
+material <- factor(data_to_model$material, levels=c('Input', 'RBP'))
+
+toxic <- factor(data_to_model$Treatment, levels=c('Safe', 'Toxic'))
+
+
+design <- model.matrix(~material*toxic)
+
+# And then usual lines to perform linear modeling with limma...
+```
+
+Build the run_limma function
+```{r}
+
+run_limma <- function(data_to_model,
+                      design,
+                      coefficient){
+
+  # run limma
+  lmfit <- data_to_model %>%
+    filterNA() %>%
+    lmFit(design) %>%
+    eBayes(trend=TRUE)
+
+  # plot model vs mean variance
+  plotSA(lmfit, main="Final model: mean-variance trend")
+
+  # obtain results table
+  lmResults <- topTable(lmfit, coef=coefficient, number=Inf)
+
+
+
+  # add max_diff column if required
+  if(is.integer(coefficient) & length(coefficient)>1){
+    logfc_col='max_diff'
+    message('Multiple numerical coffficients. Adding a "max_diff" column')
+    lmResults['max_diff'] <- lmResults %>%
+      select(all_of(gsub(':', '.', colnames(coefficients(lmfit))[coefficient]))) %>%
+      apply(MARGIN=1, function(x) x[which(abs(x)==max(abs(x)))])
+  } else logfc_col='logFC'
+
+  message('At 1% FDR')
+  print(table(ifelse(lmResults$adj.P.Val<0.01, 'Significant', 'Not significant'),
+              ifelse(lmResults[[logfc_col]]>0, 'Increase', 'Decrease')))
+
+  message('At 20% FDR')
+  print(table(ifelse(lmResults$adj.P.Val<0.2, 'Significant', 'Not significant'),
+              ifelse(lmResults[[logfc_col]]>0, 'Increase', 'Decrease')))
+
+  return(lmResults)
+}
+```
+
+build the volcano_plot function
+
+```{r}
+volcano_plot <- function(lmResultsObj,
+                         adj.P.Val_threshold=0.05,
+                         logFC_threshold=2,
+                         xcol='logFC',
+                         xlabel){
+  lmResultsObj %>%
+    mutate(sig=adj.P.Val<adj.P.Val_threshold,
+           large_effect=abs(!!sym(xcol))>logFC_threshold) %>%
+    mutate(label=ifelse(sig & large_effect, gsub('(.*GN=| PE=.*)', '', Master.Protein.Descriptions), NA)) %>%
+    ggplot(aes(!!sym(xcol), -log10(P.Value), colour=sig)) +
+    geom_point(aes(size=sig)) +
+    theme_camprot(base_size=15, border=FALSE) +
+    scale_colour_manual(values=c('grey', get_cat_palette(1)), guide=FALSE) +
+    scale_size_manual(values=c(0.5, 2), guide=FALSE) +
+    xlab(xlabel) +
+    ylab('-log10(p-value)') +
+    theme(strip.background=element_blank()) +
+    ggrepel::geom_label_repel(aes(label=label), show.legend=FALSE)
+}
+```
+
+```{r}
+
+lmResults <- run_limma(data_to_model, design, coefficient='materialRBP:toxicToxic')
+
+volcano <- volcano_plot(lmResults,
+                          adj.P.Val_threshold=0.1,
+                          logFC_threshold=0.9,
+                          xlabel='Effect of Toxic ASO on RNA binding (log2)')
+
+#define function build_results_list
+build_results_list <- function(data_to_model, design, results, volcano){
+  list('data'=data_to_model,
+       'design'=design,
+       'results'=results,
+       'volcano'=volcano)
+}
+
+lm_results <- build_results_list(data_to_model,
+                                   design,
+                                   lmResults,
+                                   volcano)
+print(lm_results$volcano)
+
+
+```
+
+
+
+```{r}
+library(biobroom)
+p<- tidy(data_to_model, addPheno=TRUE)
+
+q<- p %>% filter(protein=="Q15050")
+
+q$value <- log2(q$value)
+
+
+ # to extract quantification and experimental information in tidy format
+s<-ggplot(q, aes(x=factor(sample, level=c('127N','128C', '130N', '131C',  '133N','130C','127C','129N','132N','133C','Input127N','Input128C', 'Input130N', 'Input131C','Input133N','Input130C','Input127C','Input129N','Input132N', 'Input133C')), y=value)) + 
+  geom_dotplot(binaxis='y', stackdir='center', aes(fill=Treatment))
+
+s
+```
+------------------------------------------
+limma didn't look particularly interesting so Tom has suggested using DEqMS at the PSM level instead.
+First i need to import the PSM files for both input and for OOPS samples.
+Then i need to combine them with the limma adjusted objects.
+
+
+
+Import PSM files
+```{r}
+
+#OOPS samples
+
+OOPS_tmt_psm_res <- readRDS(here('Results/OOPS_psm_filt.rds'))
+
+#Inputs
+
+Input_tmt_psm_res <- readRDS(here('Results/input_psm_filt.rds'))
+
+
+
+```
+
+
+Import protein files in tidy format
+```{r}
+
+OOPS_tmt_prot_res <- readRDS(here('Results/OOPS_tmt_protein.rds'))
+
+Input_tmt_prot_res <- readRDS(here('Results/input_tmt_protein.rds'))
+```
+
+Now tidy them with phenotype data and filter out the vehicle treated-samples
+```{r}
+OOPS_protein_tidy <- OOPS_tmt_prot_res %>%
+  biobroom::tidy.MSnSet(addPheno=TRUE) %>% # addPheno=TRUE adds the pData so we have the sample information too
+  filter(is.finite(value))
+
+OOPS_protein_tidy <- filter(OOPS_protein_tidy, Treatment!='Vehicle')
+
+#Inputs
+
+Input_protein_tidy <- Input_tmt_prot_res %>%
+  biobroom::tidy.MSnSet(addPheno=TRUE) %>% # addPheno=TRUE adds the pData so we have the sample information too
+  filter(is.finite(value))
+
+Input_protein_tidy <- filter(Input_protein_tidy, Treatment!='Vehicle')
+
+
+```
+
+now get the minimum psm count for input and OOPS
+```{r}
+# Obtain the min peptide count across the samples and determine the minimum value across
+# samples
+#first OOPS
+OOPS_min_psm_count <- camprotR::count_features_per_protein(OOPS_tmt_psm_res) %>%
+  merge(OOPS_protein_tidy,
+        by.x=c('Master.Protein.Accessions', 'sample'),
+        by.y=c('protein', 'sample')) %>%
+  group_by(Master.Protein.Accessions) %>%
+  summarise(min_psm_count = min(n))
+
+#######Now input
+input_min_psm_count <- camprotR::count_features_per_protein(Input_tmt_psm_res) %>%
+  merge(Input_protein_tidy,
+        by.x=c('Master.Protein.Accessions', 'sample'),
+        by.y=c('protein', 'sample')) %>%
+  group_by(Master.Protein.Accessions) %>%
+  summarise(min_psm_count = min(n))
+
+
+#combine input and OOPS psm_counts 
+
+min_psm_count_input_rbp <- bind_rows(input_min_psm_count, OOPS_min_psm_count) %>% group_by(Master.Protein.Accessions) %>% summarise(min_psm_count=min(min_psm_count))
+
+limma_fit$count <- min_psm_count_input_rbp$min_psm_count
+
+```
+
+
+Now that we have PSM counts for input and OOPS, add to limma object
+```{r}
+
+#checking number of rows for between objects 
+nrow(data_to_model)
+nrow(min_psm_count_input_rbp)
+
+#showing differences between the two objects 
+setdiff(rownames(data_to_model),
+        min_psm_count_input_rbp$Master.Protein.Accessions)
+
+
+```
+
+
+
+```{r}
+#take common proteins between input and OOPS protein Rds and input min psm count, use this object for deqms
+fit1 <- lmFit(data_to_model, design)
+#fit2 <- contrasts.fit(fit1,contrasts = contrast)
+fit3 <- eBayes(fit1, trend = TRUE)
+
+
+fit3$count = tibble::column_to_rownames(
+   input_min_psm_count,'Master.Protein.Accessions')[common_proteins,'min_psm_count']
+
+fit4 = spectraCounteBayes(fit3)
+VarianceBoxplot(fit4,n=30,main="TMT15plex dataset",xlab="PSM count")
+
+
+efit_deqms <- suppressWarnings(spectraCounteBayes(fit4))
+
+
+# Diagnostic plots
+VarianceBoxplot(efit_deqms, n = 30, xlab = "PSMs")
+
+```
+
+```{r}
+deqms_results <- outputResult(efit_deqms, coef_col=4)
+
+
+table(deqms_results$sca.adj.pval<0.01)
+#> 
+#> FALSE  TRUE 
+#>  33    863
+
+
+deqms_results %>%
+  ggplot(aes(x = logFC, y = -log10(sca.P.Value), colour = sca.adj.pval < 0.01)) +
+  geom_point(size=0.5) +
+  theme_camprot(border=FALSE, base_size=15) +
+  scale_colour_manual(values = c('grey', get_cat_palette(2)[2]), name = '2x vs 1x Sig.') +
+  labs(x = 'Toxic vs Non-Toxic (Log2)', y = '-log10(p-value)') 
+
+
+
+```
+```{r}
+
+```
+
+
+Testing Errors suggested by Tom
+```{r}
+table(lmResults$count)
+
+table(is.na(lmResults$count))
+
+table(is.na(exprs(data_to_model)))
+
+table(is.na(input_min_psm_count))
+
+rowSums(is.na(exprs(data_to_model)))
+
+rowSums(is.na(input_min_psm_count))
+```
+
+```{r}
+volcano_plot <- function(lmResults,
+                         adj.P.Val_threshold=0.05,
+                         logFC_threshold=2,
+                         xcol='logFC',
+                         xlabel){
+  lmResults %>%
+    mutate(sig=adj.P.Val<adj.P.Val_threshold,
+           large_effect=abs(!!sym(xcol))>logFC_threshold) %>%
+    mutate(label=ifelse(sig & large_effect, gsub('(.*GN=| PE=.*)', '', Master.Protein.Descriptions), NA)) %>%
+    ggplot(aes(!!sym(xcol), -log10(P.Value), colour=sig)) +
+    geom_point(aes(size=sig)) +
+    theme_camprot(base_size=15, border=FALSE) +
+    scale_colour_manual(values=c('grey', get_cat_palette(1)), guide=FALSE) +
+    scale_size_manual(values=c(0.5, 2), guide=FALSE) +
+    xlab(xlabel) +
+    ylab('-log10(p-value)') +
+    theme(strip.background=element_blank()) +
+    ggrepel::geom_label_repel(aes(label=label), show.legend=FALSE)
+}
+
+
+volcano_plot <- function(lmResults,
+                         adj.P.Val_threshold=0.05,
+                         logFC_threshold=2,
+                         xcol='logFC',
+                         xlabel){
+  lmResults %>%
+    mutate(sig=adj.P.Val<adj.P.Val_threshold,
+           large_effect=abs(!!sym(xcol))>logFC_threshold) %>%
+    mutate(label=ifelse(sig & large_effect, gsub('(.*GN=| PE=.*)', '', Master.Protein.Descriptions), NA)) %>%
+    ggplot(aes(!!sym(xcol), -log10(P.Value), colour=sig)) +
+    geom_point(aes(size=sig)) +
+    theme_camprot(base_size=15, border=FALSE) +
+    scale_colour_manual(values=c('grey', get_cat_palette(1)), guide=FALSE) +
+    scale_size_manual(values=c(0.5, 2), guide=FALSE) +
+    xlab(xlabel) +
+    ylab('-log10(p-value)') +
+    theme(strip.background=element_blank()) +
+    ggrepel::geom_label_repel(aes(label=label), show.legend=FALSE)
+}
+
+
+
+volcano <- volcano_plot(lmResults,
+                          adj.P.Val_threshold=0.1,
+                          logFC_threshold=0.9,
+                          xlabel='Effect of Toxic ASO on RNA binding (log2)')
+
+#define function build_results_list
+build_results_list <- function(lmResults, design, results, volcano){
+  list('data'=lmResults,
+       'design'=design,
+       'results'=results,
+       'volcano'=volcano)
+}
+
+lmResults <- build_results_list(lmResults,
+                                   design,
+                                   lmResults,
+                                   volcano)
+print(lmResults$volcano)
+```
+
+---------------------------------------------------
+Let's try looking at any differences between my L2K and safe ASO
+
+```{r}
+#L2k vs Safe ASO statistical testing
+
+data_to_model2 <- expInputRBP[,pData(expInputRBP)$Treatment!='Toxic'] # or some equivalent filtering to remove the samples which are Vehicle treatment
+
+#assign input and RBPs as factors in the material column of the data_to_model dataset.
+material2 <- factor(data_to_model2$material, levels=c('Input', 'RBP'))
+
+safe <- factor(data_to_model2$Treatment, levels=c('Safe', 'Vehicle'))
+
+
+design2 <- model.matrix(~material2*safe)
+
+# And then usual lines to perform linear modeling with limma...
+```
+
+Build the run_limma function
+```{r}
+
+run_limma2 <- function(data_to_model2,
+                      design2,
+                      coefficient){
+
+  # run limma
+  lmfit <- data_to_model2 %>%
+    filterNA() %>%
+    lmFit(design) %>%
+    eBayes(trend=TRUE)
+
+  # plot model vs mean variance
+  plotSA(lmfit, main="Final model: mean-variance trend")
+
+  # obtain results table
+  lmResults2 <- topTable(lmfit, coef=coefficient, number=Inf)
+
+
+
+  # add max_diff column if required
+  if(is.integer(coefficient) & length(coefficient)>1){
+    logfc_col='max_diff'
+    message('Multiple numerical coffficients. Adding a "max_diff" column')
+    lmResults2['max_diff'] <- lmResults2 %>%
+      select(all_of(gsub(':', '.', colnames(coefficients(lmfit))[coefficient]))) %>%
+      apply(MARGIN=1, function(x) x[which(abs(x)==max(abs(x)))])
+  } else logfc_col='logFC'
+
+  message('At 1% FDR')
+  print(table(ifelse(lmResults$adj.P.Val<0.01, 'Significant', 'Not significant'),
+              ifelse(lmResults[[logfc_col]]>0, 'Increase', 'Decrease')))
+
+  message('At 20% FDR')
+  print(table(ifelse(lmResults$adj.P.Val<0.2, 'Significant', 'Not significant'),
+              ifelse(lmResults[[logfc_col]]>0, 'Increase', 'Decrease')))
+
+  return(lmResults2)
+}
+```
+
+build the volcano_plot function
+
+```{r}
+volcano_plot2 <- function(lmResultsObj2,
+                         adj.P.Val_threshold=0.05,
+                         logFC_threshold=2,
+                         xcol='logFC',
+                         xlabel){
+  lmResultsObj2 %>%
+    mutate(sig=adj.P.Val<adj.P.Val_threshold,
+           large_effect=abs(!!sym(xcol))>logFC_threshold) %>%
+    mutate(label=ifelse(sig & large_effect, gsub('(.*GN=| PE=.*)', '', Master.Protein.Descriptions), NA)) %>%
+    ggplot(aes(!!sym(xcol), -log10(P.Value), colour=sig)) +
+    geom_point(aes(size=sig)) +
+    theme_camprot(base_size=15, border=FALSE) +
+    scale_colour_manual(values=c('grey', get_cat_palette(1)), guide=FALSE) +
+    scale_size_manual(values=c(0.5, 2), guide=FALSE) +
+    xlab(xlabel) +
+    ylab('-log10(p-value)') +
+    theme(strip.background=element_blank()) +
+    ggrepel::geom_label_repel(aes(label=label), show.legend=FALSE)
+}
+```
+
+```{r}
+
+lmResults2 <- run_limma2(data_to_model2, design2, coefficient='material2RBP:safeVehicle')
+
+volcano2 <- volcano_plot(lmResults2,
+                          adj.P.Val_threshold=0.1,
+                          logFC_threshold=0.9,
+                          xlabel='Effect of Safe ASO on RNA binding (log2)')
+
+#define function build_results_list
+build_results_list2 <- function(data_to_model2, design2, results2, volcano2){
+  list('data'=data_to_model2,
+       'design'=design2,
+       'results2'=results2,
+       'volcano'=volcano2)
+}
+
+lm_results2 <- build_results_list2(data_to_model2,
+                                   design2,
+                                   lmResults2,
+                                   volcano2)
+print(lm_results2$volcano2)
+
+```
+
+```{r}
+fit1_2 <- lmFit(data_to_model2, design2)
+#fit2 <- contrasts.fit(fit1,contrasts = contrast)
+fit3_2 <- eBayes(fit1_2, trend = TRUE)
+
+
+fit3_2$count = tibble::column_to_rownames(
+   input_min_psm_count,'Master.Protein.Accessions')[common_proteins,'min_psm_count']
+
+fit4_2 = spectraCounteBayes(fit3_2)
+VarianceBoxplot(fit4_2,n=30,main="TMT15plex dataset",xlab="PSM count")
+
+
+efit_deqms2 <- suppressWarnings(spectraCounteBayes(fit4_2))
+
+
+# Diagnostic plots
+VarianceBoxplot(efit_deqms2, n = 30, xlab = "PSMs")
+```
+```{r}
+
+deqms_results2 <- outputResult(efit_deqms2, coef_col=4)
+
+
+table(deqms_results2$sca.adj.pval<0.01)
+#> 
+#> FALSE  
+#> 896
+
+
+deqms_results2 %>%
+  ggplot(aes(x = logFC, y = -log10(sca.P.Value), colour = sca.adj.pval < 0.01)) +
+  geom_point(size=0.5) +
+  theme_camprot(border=FALSE, base_size=15) +
+  scale_colour_manual(values = c('grey', get_cat_palette(2)[2]), name = '2x vs 1x Sig.') +
+  labs(x = 'Toxic vs Non-Toxic (Log2)', y = '-log10(p-value)') 
+
+
+```
