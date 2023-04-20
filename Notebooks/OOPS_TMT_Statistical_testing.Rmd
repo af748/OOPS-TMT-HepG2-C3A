@@ -303,25 +303,8 @@ deqms_results %>%
 
 
 ```
-```{r}
-
-```
 
 
-Testing Errors suggested by Tom
-```{r}
-table(lmResults$count)
-
-table(is.na(lmResults$count))
-
-table(is.na(exprs(data_to_model)))
-
-table(is.na(input_min_psm_count))
-
-rowSums(is.na(exprs(data_to_model)))
-
-rowSums(is.na(input_min_psm_count))
-```
 
 ```{r}
 volcano_plot <- function(lmResults,
