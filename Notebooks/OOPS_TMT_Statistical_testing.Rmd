@@ -1,5 +1,9 @@
 ---
-title: "OOPS_TMT_Statistical_testing"
+title: "OOPMS_TMT_Statistical_Testing"
+output: html_notebook
+---
+---
+title: "OOPS_TMT_Statistical_Testing"
 output: html_notebook
 ---
 30-03-2023
@@ -122,6 +126,9 @@ volcano_plot <- function(lmResultsObj,
 }
 ```
 
+
+Plot the limma volcano
+
 ```{r}
 
 lmResults <- run_limma(data_to_model, design, coefficient='materialRBP:toxicToxic')
@@ -148,7 +155,9 @@ print(lm_results$volcano)
 
 ```
 
+Limma showed no significant RBPs
 
+plot data to model, looking at a specific protein to see if there is any variability between the samples.
 
 ```{r}
 library(biobroom)
@@ -165,6 +174,7 @@ s<-ggplot(q, aes(x=factor(sample, level=c('127N','128C', '130N', '131C',  '133N'
 
 s
 ```
+
 ------------------------------------------
 limma didn't look particularly interesting so Tom has suggested using DEqMS at the PSM level instead.
 First i need to import the PSM files for both input and for OOPS samples.
