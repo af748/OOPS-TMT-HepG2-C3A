@@ -19,8 +19,6 @@ library(here)
 
 ```{r}
 psm_data <- read.delim(here('Extdata/4034462575_AF_input-(1)_PSMs.txt'))
-
-
 ```
 
 ```{r}
@@ -37,11 +35,31 @@ crap_accessions <- crap_fasta %>%
   unlist()
 ```
 
+No cRAP proteins are removed! Have they already been removed before the file was 
+exported from PD? That's not normally the case. Check with Bini?
 ```{r}
-#use the crap proteins to filter my PSM data
+psm_data_flt <- parse_features(
+  psm_data,
+  crap_proteins=crap_accessions,
+  TMT=TRUE,
+  level = 'PSM')
+```
+Futher sanity check for whether there are any peptides from contaminant proteins present
+```{r}
+# Will be True if PD thinks the peptides is from a contaminant protein
+table(psm_data$Contaminant)
+
+# Depending on the fasta entry names and how they are parsed, the
+# cRAP proteins can sometimes be called 'sp' erroneously
+# Run pull(crap_fasta, desc) to see why
+psm_data %>% filter(grepl('sp', Protein.Accessions))
+```
+
+Re-run `parse_features` without filtering cRAP (same results as previous)
+```{r}
 psm_data_flt <- parse_features(
   psm_data, 
-  crap_proteins = crap_accessions, 
+  filter_crap=FALSE,
   TMT = TRUE, 
   level = 'PSM'
 )
@@ -59,13 +77,21 @@ psm.f <- psm_data_flt[, setdiff(colnames(psm_data_flt), abundance_cols)]
 # update the column names to remove the 'Abundance.` prefix
 colnames(psm.e) <- gsub('Abundance.', '', colnames(psm.e))
 
-# we don't have 'phenotype' data to add so we just define the 
-# 'expression' data and 'feature' data
-
-psm.p <- data.frame(Treatment=rep(factor(c('Vehicle', 'Safe', 'Toxic','Vehicle', 'Safe', 'Toxic','Vehicle', 'Safe', 'Toxic','Vehicle', 'Safe', 'Toxic','Vehicle', 'Safe', 'Toxic')), c(1,1,1,1,1,1,1,1,1,1,1,1,1,1,1)), row.names=colnames(psm.e))
+# hardcoding experimental design as we know what it is
+psm.p <- data.frame(Treatment=factor(rep(c('Vehicle', 'Safe', 'Toxic'), times=5)), row.names=colnames(psm.e))
   
 psm <- MSnbase::MSnSet(exprs = psm.e, fData = psm.f, pData=psm.p)
+
+
 ```
+
+We have some rows in our PSM quantification where all samples are NA. We want to remove these
+```{r}
+table(rowSums(is.na(exprs(psm))))
+psm <- psm[rowSums(is.na(exprs(psm))) < ncol(exprs(psm))]
+table(rowSums(is.na(exprs(psm))))
+```
+
 
 Plot intensity distributions
 
@@ -73,23 +99,23 @@ Plot intensity distributions
 plot_quant(log(psm, base=2), method='density')
 ```
 We want to remove low Signal:Noise (S:N) PSMs, since the quantification values will be less accurate and there will be more missing values. We can inspect the relationship between S:N and missing values using the plot_missing_SN function.
+
+
 ```{r}
-plot_missing_SN(psm, bins = 40)
+plot_missing_SN(psm[fData(psm)$Average.Reporter.SN<30,], bins = 20)
 ```
 We can also look into this relationship at the tag level using plot_missing_SN_per_sample. In this case, there is no tag which appears to have a high proportion of missing values when signal:noise > 5. If there were, this may warrant further exploration, e.g was one of the sample preparations inadequate such that fewer peptides were labeled?
 ```{r}
-plot_missing_SN_per_sample(psm, bins = 40)
+plot_missing_SN_per_sample(psm[fData(psm)$Average.Reporter.SN<30,], bins = 20)
 ```
+
 Based on the above, we will filter the PSMs to only retain those with S:N > 5 using filter_TMT_PSMs. Using the same function, we will also remove PSMs with interference/co-isolation >50%.
 
 ```{r}
 psm_filt_sn_int <- filter_TMT_PSMs(psm, inter_thresh = 50, sn_thresh = 5)
-#54674 features found from 6684 master proteins => No quant filtering
-#52725 features found from 6624 master proteins => Co-isolation filtering
-#52159 features found from 6573 master proteins => S:N ratio filtering
 ```
 
-For PSM to protein summarisation, we will use naive ‘sum’ summarisation (MSnbase::combineFeatures(method = 'sum')). This approach does not appropriately handle missing values, since it either returns NA if any value is missing, or, with na.rm=TRUE included, replaces NA with zero where there is at least one finite quantification value for a protein. As such, we will remove the few PSMs with any missing values
+For PSM to protein summarisation, we will use naive ‘sum’ summarisation (MSnbase::combineFeatures(method = 'sum')). This approach does not appropriately handle missing values, since it either returns NA if any value is missing, or, with na.rm=TRUE included, replaces NA with zero where there is at least one finite quantification value for a protein. As such, we will remove the very few PSMs with any missing values
 
 ```{r}
 psm_filt_sn_int_missing <- psm_filt_sn_int %>% 
@@ -102,6 +128,17 @@ Typically, one removes proteins with a single PSM, the so-called ‘one-hit wond
 psm_filt_sn_int_missing_n_features <- psm_filt_sn_int_missing %>%
   camprotR::restrict_features_per_protein(min_features=2, plot=FALSE)
 ```
+
+Below, we summarise the number of PSMs at each level of filtering
+```{r}
+dim(psm_data)
+dim(psm) # Greatest loss from psm_data -> psm (no quant, or all NA, or no unique master protein)
+dim(psm_filt_sn_int)
+dim(psm_filt_sn_int_missing)
+dim(psm_filt_sn_int_missing_n_features)
+
+```
+
 Below, we perform the summarisation.
 
 ```{r}
@@ -117,7 +154,8 @@ Finally, we assess the quantification distribution and normalise the protein-lev
 ```{r}
 plot_quant(log(protein, base=2), method='density')
 ```
- protein-level intensity distributions are very similar
+
+Protein-level intensity distributions are very similar
  
 The next step should be to normalise the protein-level intensities.
 
@@ -143,10 +181,11 @@ Now we have filtered our PSM-level quantification, summarised to protein-level a
 
 We save the object to disk so we can read it back into memory when we need it
 ```{r}
-saveRDS(psm_filt_sn_int_missing, here('OOPS-TMT-HepG2.C3A/Results/input_psm_filt.rds'))
-saveRDS(protein_norm, here( 'OOPS-TMT-HepG2.C3A/Results/input_tmt_protein.rds'))
+saveRDS(psm_filt_sn_int_missing, here('Results/input_psm_filt.rds'))
+saveRDS(protein_norm, here('Results/input_tmt_protein.rds'))
 ```
 
+Sanity check that all proteins in the final PSM object are in the protein-level object
 ```{r}
 length(setdiff(fData(psm_filt_sn_int_missing)$Master.Protein.Accessions,
                fData(protein_norm)$Master.Protein.Accessions))
@@ -155,34 +194,21 @@ length(setdiff(fData(psm_filt_sn_int_missing)$Master.Protein.Accessions,
 --------------------------------------------------------------------
 --------------------------------------------------------------------
 --------------------------------------------------------------------
-That was all for the inputs, now I should do this for the samples
+That was all for the inputs, now I should do this for the OOPS samples
 
 
 
 
 ```{r}
-OOPS_psm_data <- read.delim(here('OOPS-TMT-HepG2.C3A/Extdata/4034462575_AF_OOPS_PSMs.txt'))
+OOPS_psm_data <- read.delim(here('Extdata/4034462575_AF_OOPS_PSMs.txt'))
 ```
 
-```{r}
-crap_fasta_inf <-here('OOPS-TMT-HepG2.C3A/Extdata/crap.fasta')
-
-# Load the cRAP FASTA used for the PD search
-
-crap_fasta <- Biostrings::fasta.index(crap_fasta_inf, seqtype = "AA")
-
-# Extract the non-cRAP UniProt accessions associated with each cRAP protein
-crap_accessions <- crap_fasta %>% 
-  pull(desc) %>% 
-  stringr::str_extract_all(pattern="(?<=\\|).*?(?=\\|)") %>% 
-  unlist()
-```
 
 ```{r}
 #use the crap proteins to filter my PSM data
 OOPS_psm_data_flt <- parse_features(
   OOPS_psm_data, 
-  crap_proteins = crap_accessions, 
+  filter_crap=FALSE,
   TMT = TRUE, 
   level = 'PSM'
 )
@@ -204,9 +230,16 @@ colnames(OOPS_psm.e) <- gsub('Abundance.', 'Input', colnames(OOPS_psm.e))
 # 'expression' data and 'feature' data
 
 
-OOPS_psm.p <- data.frame(Treatment=rep(factor(c('Vehicle', 'Safe', 'Toxic','Vehicle', 'Safe', 'Toxic','Vehicle', 'Safe', 'Toxic','Vehicle', 'Safe', 'Toxic','Vehicle', 'Safe', 'Toxic')), c(1,1,1,1,1,1,1,1,1,1,1,1,1,1,1)), row.names=colnames(OOPS_psm.e))
+OOPS_psm.p <- data.frame(Treatment=factor(rep(c('Vehicle', 'Safe', 'Toxic'), times=5)), row.names=colnames(OOPS_psm.e))
   
 OOPS_psm <- MSnbase::MSnSet(exprs = OOPS_psm.e, fData = OOPS_psm.f, pData=OOPS_psm.p)
+```
+
+We have some rows in our PSM quantification where all samples are NA. We want to remove these
+```{r}
+table(rowSums(is.na(exprs(OOPS_psm))))
+OOPS_psm <- OOPS_psm[rowSums(is.na(exprs(OOPS_psm))) < ncol(exprs(OOPS_psm))]
+table(rowSums(is.na(exprs(OOPS_psm))))
 ```
 
 Plot intensity distributions
@@ -216,13 +249,21 @@ plot_quant(log(OOPS_psm, base=2), method='density')
 ```
 We want to remove low Signal:Noise (S:N) PSMs, since the quantification values will be less accurate and there will be more missing values. We can inspect the relationship between S:N and missing values using the plot_missing_SN function.
 ```{r}
-plot_missing_SN(OOPS_psm, bins = 40)
+plot_missing_SN(OOPS_psm[fData(OOPS_psm)$Average.Reporter.SN<100,], bins = 25)
 ```
-We can also look into this relationship at the tag level using plot_missing_SN_per_sample. In this case, there is no tag which appears to have a high proportion of missing values when signal:noise > 5. If there were, this may warrant further exploration, e.g was one of the sample preparations inadequate such that fewer peptides were labeled?
+We can also look into this relationship at the tag level using plot_missing_SN_per_sample. In this case, although there are tags which have a higher proportion of missing values when signal:noise > 5, this does appear to relate to the experimental condition at all. 
 ```{r}
-plot_missing_SN_per_sample(OOPS_psm, bins = 40)
+# new object with updated sample names so the plot is more informative
+OOPS_psm_rename_samples <- OOPS_psm
+colnames(OOPS_psm_rename_samples) <- paste(pData(OOPS_psm)$Treatment, colnames(OOPS_psm), sep='-')
+
+plot_missing_SN_per_sample(OOPS_psm_rename_samples[fData(OOPS_psm_rename_samples)$Average.Reporter.SN<100,], bins = 25)
+
 ```
 Based on the above, we will filter the PSMs to only retain those with S:N > 5 using filter_TMT_PSMs. Using the same function, we will also remove PSMs with interference/co-isolation >50%.
+```{r}
+table(fData(OOPS_psm)$Average.Reporter.SN<10)
+```
 
 ```{r}
 OOPS_psm_filt_sn_int <- filter_TMT_PSMs(OOPS_psm, inter_thresh = 50, sn_thresh = 5)
@@ -244,6 +285,18 @@ Typically, one removes proteins with a single PSM, the so-called ‘one-hit wond
 OOPS_psm_filt_sn_int_missing_n_features <- OOPS_psm_filt_sn_int_missing %>%
   camprotR::restrict_features_per_protein(min_features=2, plot=FALSE)
 ```
+
+
+Below, we summarise the number of PSMs at each level of filtering
+```{r}
+dim(OOPS_psm_data)
+dim(OOPS_psm) # Greatest loss from psm_data -> psm (no quant, or all NA, or no unique master protein)
+dim(OOPS_psm_filt_sn_int)
+dim(OOPS_psm_filt_sn_int_missing)
+dim(OOPS_psm_filt_sn_int_missing_n_features)
+
+```
+
 Below, we perform the summarisation.
 
 ```{r}
@@ -285,15 +338,9 @@ Now we have filtered our PSM-level quantification, summarised to protein-level a
 
 We save the object to disk so we can read it back into memory when we need it
 ```{r}
-saveRDS(OOPS_psm_filt_sn_int_missing, here('OOPS-TMT-HepG2.C3A/Results/OOPS_psm_filt.rds'))
-saveRDS(OOPS_protein_norm, here( 'OOPS-TMT-HepG2.C3A/Results/OOPS_tmt_protein.rds'))
+saveRDS(OOPS_psm_filt_sn_int_missing, here('Results/OOPS_psm_filt.rds'))
+saveRDS(OOPS_protein_norm, here('Results/OOPS_tmt_protein.rds'))
 ```
 
-```{r}
-length(setdiff(fData(OOPS_psm_filt_sn_int_missing)$Master.Protein.Accessions,
-               fData(OOPS_protein_norm)$Master.Protein.Accessions))
-
-
-```
 
 
